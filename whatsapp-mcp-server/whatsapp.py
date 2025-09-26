@@ -10,6 +10,22 @@ import audio
 MESSAGES_DB_PATH = os.path.join(os.path.dirname(os.path.abspath(__file__)), '..', 'whatsapp-bridge', 'store', 'messages.db')
 WHATSAPP_API_BASE_URL = "http://localhost:8080/api"
 
+def is_whitelisted(jid: str) -> bool:
+    """Check if a JID is whitelisted via API call."""
+    try:
+        url = f"{WHATSAPP_API_BASE_URL}/whitelist/check"
+        payload = {"jid": jid}
+        response = requests.post(url, json=payload)
+
+        if response.status_code == 200:
+            result = response.json()
+            return result.get("whitelisted", False)
+        else:
+            return False
+    except Exception as e:
+        print(f"Error checking whitelist status: {e}")
+        return False
+
 @dataclass
 class Message:
     timestamp: datetime
@@ -143,6 +159,8 @@ def list_messages(
         query_parts.append("JOIN chats ON messages.chat_jid = chats.jid")
         where_clauses = []
         params = []
+
+        where_clauses.append("chats.whitelisted = TRUE")
         
         # Add filters
         if after:
@@ -164,10 +182,30 @@ def list_messages(
             params.append(before)
 
         if sender_phone_number:
+            sender_jid = sender_phone_number if '@' in sender_phone_number else f"{sender_phone_number}@s.whatsapp.net"
+            cursor_check = conn.cursor()
+            cursor_check.execute("SELECT whitelisted FROM chats WHERE jid = ?", (sender_jid,))
+            check_result = cursor_check.fetchone()
+            if check_result and not check_result[0]:
+                raise ValueError(f"User {sender_phone_number} is not whitelisted")
+            elif not check_result:
+                cursor_check.execute("SELECT whitelisted FROM chats WHERE jid LIKE ?", (f"%{sender_phone_number}%",))
+                check_result = cursor_check.fetchone()
+                if check_result and not check_result[0]:
+                    raise ValueError(f"User {sender_phone_number} is not whitelisted")
+
             where_clauses.append("messages.sender = ?")
             params.append(sender_phone_number)
             
         if chat_jid:
+            cursor_check = conn.cursor()
+            cursor_check.execute("SELECT whitelisted FROM chats WHERE jid = ?", (chat_jid,))
+            check_result = cursor_check.fetchone()
+            if check_result and not check_result[0]:
+                raise ValueError(f"Chat {chat_jid} is not whitelisted")
+            elif not check_result:
+                raise ValueError(f"Chat {chat_jid} not found")
+
             where_clauses.append("messages.chat_jid = ?")
             params.append(chat_jid)
             
@@ -238,7 +276,7 @@ def get_message_context(
             SELECT messages.timestamp, messages.sender, chats.name, messages.content, messages.is_from_me, chats.jid, messages.id, messages.chat_jid, messages.media_type
             FROM messages
             JOIN chats ON messages.chat_jid = chats.jid
-            WHERE messages.id = ?
+            WHERE messages.id = ? AND chats.whitelisted = TRUE
         """, (message_id,))
         msg_data = cursor.fetchone()
         
@@ -348,11 +386,13 @@ def list_chats(
             
         where_clauses = []
         params = []
-        
+
+        where_clauses.append("chats.whitelisted = TRUE")
+
         if query:
             where_clauses.append("(LOWER(chats.name) LIKE LOWER(?) OR chats.jid LIKE ?)")
             params.extend([f"%{query}%", f"%{query}%"])
-            
+
         if where_clauses:
             query_parts.append("WHERE " + " AND ".join(where_clauses))
             
@@ -400,13 +440,14 @@ def search_contacts(query: str) -> List[Contact]:
         search_pattern = '%' +query + '%'
         
         cursor.execute("""
-            SELECT DISTINCT 
+            SELECT DISTINCT
                 jid,
                 name
             FROM chats
-            WHERE 
+            WHERE
                 (LOWER(name) LIKE LOWER(?) OR LOWER(jid) LIKE LOWER(?))
                 AND jid NOT LIKE '%@g.us'
+                AND whitelisted = TRUE
             ORDER BY name, jid
             LIMIT 50
         """, (search_pattern, search_pattern))
@@ -434,7 +475,7 @@ def search_contacts(query: str) -> List[Contact]:
 
 def get_contact_chats(jid: str, limit: int = 20, page: int = 0) -> List[Chat]:
     """Get all chats involving the contact.
-    
+
     Args:
         jid: The contact's JID to search for
         limit: Maximum number of chats to return (default 20)
@@ -443,7 +484,20 @@ def get_contact_chats(jid: str, limit: int = 20, page: int = 0) -> List[Chat]:
     try:
         conn = sqlite3.connect(MESSAGES_DB_PATH)
         cursor = conn.cursor()
-        
+
+        # Check if the contact is whitelisted
+        cursor.execute("SELECT whitelisted FROM chats WHERE jid = ?", (jid,))
+        check_result = cursor.fetchone()
+        if check_result and not check_result[0]:
+            raise ValueError(f"User {jid} is not whitelisted")
+        elif not check_result:
+            # Check by partial match for phone numbers
+            if not '@' in jid:
+                cursor.execute("SELECT whitelisted FROM chats WHERE jid LIKE ?", (f"%{jid}%",))
+                check_result = cursor.fetchone()
+                if check_result and not check_result[0]:
+                    raise ValueError(f"User {jid} is not whitelisted")
+
         cursor.execute("""
             SELECT DISTINCT
                 c.jid,
@@ -454,13 +508,13 @@ def get_contact_chats(jid: str, limit: int = 20, page: int = 0) -> List[Chat]:
                 m.is_from_me as last_is_from_me
             FROM chats c
             JOIN messages m ON c.jid = m.chat_jid
-            WHERE m.sender = ? OR c.jid = ?
+            WHERE (m.sender = ? OR c.jid = ?) AND c.whitelisted = TRUE
             ORDER BY c.last_message_time DESC
             LIMIT ? OFFSET ?
         """, (jid, jid, limit, page * limit))
-        
+
         chats = cursor.fetchall()
-        
+
         result = []
         for chat_data in chats:
             chat = Chat(
@@ -472,9 +526,9 @@ def get_contact_chats(jid: str, limit: int = 20, page: int = 0) -> List[Chat]:
                 last_is_from_me=chat_data[5]
             )
             result.append(chat)
-            
+
         return result
-        
+
     except sqlite3.Error as e:
         print(f"Database error: {e}")
         return []
@@ -488,9 +542,22 @@ def get_last_interaction(jid: str) -> str:
     try:
         conn = sqlite3.connect(MESSAGES_DB_PATH)
         cursor = conn.cursor()
-        
+
+        # First check if the contact is whitelisted
+        cursor.execute("SELECT whitelisted FROM chats WHERE jid = ?", (jid,))
+        check_result = cursor.fetchone()
+        if check_result and not check_result[0]:
+            raise ValueError(f"User {jid} is not whitelisted")
+        elif not check_result:
+            # Check by partial match for phone numbers
+            if not '@' in jid:
+                cursor.execute("SELECT whitelisted FROM chats WHERE jid LIKE ?", (f"%{jid}%",))
+                check_result = cursor.fetchone()
+                if check_result and not check_result[0]:
+                    raise ValueError(f"User {jid} is not whitelisted")
+
         cursor.execute("""
-            SELECT 
+            SELECT
                 m.timestamp,
                 m.sender,
                 c.name,
@@ -501,16 +568,16 @@ def get_last_interaction(jid: str) -> str:
                 m.media_type
             FROM messages m
             JOIN chats c ON m.chat_jid = c.jid
-            WHERE m.sender = ? OR c.jid = ?
+            WHERE (m.sender = ? OR c.jid = ?) AND c.whitelisted = TRUE
             ORDER BY m.timestamp DESC
             LIMIT 1
         """, (jid, jid))
-        
+
         msg_data = cursor.fetchone()
-        
+
         if not msg_data:
             return None
-            
+
         message = Message(
             timestamp=datetime.fromisoformat(msg_data[0]),
             sender=msg_data[1],
@@ -521,9 +588,9 @@ def get_last_interaction(jid: str) -> str:
             id=msg_data[6],
             media_type=msg_data[7]
         )
-        
+
         return format_message(message)
-        
+
     except sqlite3.Error as e:
         print(f"Database error: {e}")
         return None
@@ -537,9 +604,17 @@ def get_chat(chat_jid: str, include_last_message: bool = True) -> Optional[Chat]
     try:
         conn = sqlite3.connect(MESSAGES_DB_PATH)
         cursor = conn.cursor()
-        
+
+        # First check if chat exists and is whitelisted
+        cursor.execute("SELECT whitelisted FROM chats WHERE jid = ?", (chat_jid,))
+        check_result = cursor.fetchone()
+        if check_result and not check_result[0]:
+            raise ValueError(f"Chat {chat_jid} is not whitelisted")
+        elif not check_result:
+            return None
+
         query = """
-            SELECT 
+            SELECT
                 c.jid,
                 c.name,
                 c.last_message_time,
@@ -548,21 +623,21 @@ def get_chat(chat_jid: str, include_last_message: bool = True) -> Optional[Chat]
                 m.is_from_me as last_is_from_me
             FROM chats c
         """
-        
+
         if include_last_message:
             query += """
-                LEFT JOIN messages m ON c.jid = m.chat_jid 
+                LEFT JOIN messages m ON c.jid = m.chat_jid
                 AND c.last_message_time = m.timestamp
             """
-            
-        query += " WHERE c.jid = ?"
-        
+
+        query += " WHERE c.jid = ? AND c.whitelisted = TRUE"
+
         cursor.execute(query, (chat_jid,))
         chat_data = cursor.fetchone()
-        
+
         if not chat_data:
             return None
-            
+
         return Chat(
             jid=chat_data[0],
             name=chat_data[1],
@@ -571,7 +646,7 @@ def get_chat(chat_jid: str, include_last_message: bool = True) -> Optional[Chat]
             last_sender=chat_data[4],
             last_is_from_me=chat_data[5]
         )
-        
+
     except sqlite3.Error as e:
         print(f"Database error: {e}")
         return None
@@ -585,9 +660,26 @@ def get_direct_chat_by_contact(sender_phone_number: str) -> Optional[Chat]:
     try:
         conn = sqlite3.connect(MESSAGES_DB_PATH)
         cursor = conn.cursor()
-        
+
+        # First check if chat exists at all
         cursor.execute("""
-            SELECT 
+            SELECT jid, whitelisted FROM chats
+            WHERE jid LIKE ? AND jid NOT LIKE '%@g.us'
+            LIMIT 1
+        """, (f"%{sender_phone_number}%",))
+
+        chat_check = cursor.fetchone()
+
+        if not chat_check:
+            return None
+
+        jid, whitelisted = chat_check
+
+        if not whitelisted:
+            raise ValueError(f"User {sender_phone_number} is not whitelisted")
+
+        cursor.execute("""
+            SELECT
                 c.jid,
                 c.name,
                 c.last_message_time,
@@ -595,17 +687,17 @@ def get_direct_chat_by_contact(sender_phone_number: str) -> Optional[Chat]:
                 m.sender as last_sender,
                 m.is_from_me as last_is_from_me
             FROM chats c
-            LEFT JOIN messages m ON c.jid = m.chat_jid 
+            LEFT JOIN messages m ON c.jid = m.chat_jid
                 AND c.last_message_time = m.timestamp
-            WHERE c.jid LIKE ? AND c.jid NOT LIKE '%@g.us'
+            WHERE c.jid LIKE ? AND c.jid NOT LIKE '%@g.us' AND c.whitelisted = TRUE
             LIMIT 1
         """, (f"%{sender_phone_number}%",))
-        
+
         chat_data = cursor.fetchone()
-        
+
         if not chat_data:
             return None
-            
+
         return Chat(
             jid=chat_data[0],
             name=chat_data[1],
@@ -614,7 +706,7 @@ def get_direct_chat_by_contact(sender_phone_number: str) -> Optional[Chat]:
             last_sender=chat_data[4],
             last_is_from_me=chat_data[5]
         )
-        
+
     except sqlite3.Error as e:
         print(f"Database error: {e}")
         return None

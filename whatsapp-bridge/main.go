@@ -64,7 +64,8 @@ func NewMessageStore() (*MessageStore, error) {
 		CREATE TABLE IF NOT EXISTS chats (
 			jid TEXT PRIMARY KEY,
 			name TEXT,
-			last_message_time TIMESTAMP
+			last_message_time TIMESTAMP,
+			whitelisted BOOLEAN DEFAULT FALSE
 		);
 		
 		CREATE TABLE IF NOT EXISTS messages (
@@ -100,8 +101,8 @@ func (store *MessageStore) Close() error {
 
 // Store a chat in the database
 func (store *MessageStore) StoreChat(jid, name string, lastMessageTime time.Time) error {
-	_, err := store.db.Exec(
-		"INSERT OR REPLACE INTO chats (jid, name, last_message_time) VALUES (?, ?, ?)",
+	_, err := store.db.ExecContext(context.Background(),
+		"INSERT INTO chats (jid, name, last_message_time, whitelisted) VALUES (?, ?, ?, FALSE) ON CONFLICT(jid) DO UPDATE SET name = excluded.name, last_message_time = excluded.last_message_time",
 		jid, name, lastMessageTime,
 	)
 	return err
@@ -115,9 +116,9 @@ func (store *MessageStore) StoreMessage(id, chatJID, sender, content string, tim
 		return nil
 	}
 
-	_, err := store.db.Exec(
-		`INSERT OR REPLACE INTO messages 
-		(id, chat_jid, sender, content, timestamp, is_from_me, media_type, filename, url, media_key, file_sha256, file_enc_sha256, file_length) 
+	_, err := store.db.ExecContext(context.Background(),
+		`INSERT OR REPLACE INTO messages
+		(id, chat_jid, sender, content, timestamp, is_from_me, media_type, filename, url, media_key, file_sha256, file_enc_sha256, file_length)
 		VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)`,
 		id, chatJID, sender, content, timestamp, isFromMe, mediaType, filename, url, mediaKey, fileSHA256, fileEncSHA256, fileLength,
 	)
@@ -170,6 +171,57 @@ func (store *MessageStore) GetChats() (map[string]time.Time, error) {
 	}
 
 	return chats, nil
+}
+
+func (store *MessageStore) IsWhitelisted(jid string) bool {
+	var whitelisted bool
+	err := store.db.QueryRow("SELECT whitelisted FROM chats WHERE jid = ?", jid).Scan(&whitelisted)
+	if err != nil {
+		return false
+	}
+	return whitelisted
+}
+
+func (store *MessageStore) SetWhitelist(jid string, whitelisted bool) error {
+	_, err := store.db.Exec("UPDATE chats SET whitelisted = ? WHERE jid = ?", whitelisted, jid)
+	return err
+}
+
+func (store *MessageStore) GetWhitelistedChats() (map[string]time.Time, error) {
+	rows, err := store.db.Query("SELECT jid, last_message_time FROM chats WHERE whitelisted = TRUE ORDER BY last_message_time DESC")
+	if err != nil {
+		return nil, err
+	}
+	defer rows.Close()
+
+	chats := make(map[string]time.Time)
+	for rows.Next() {
+		var jid string
+		var lastMessageTime time.Time
+		err := rows.Scan(&jid, &lastMessageTime)
+		if err != nil {
+			return nil, err
+		}
+		chats[jid] = lastMessageTime
+	}
+
+	return chats, nil
+}
+
+func validatePhoneNumber(phoneNumber string) bool {
+	if len(phoneNumber) < 10 || len(phoneNumber) > 15 {
+		return false
+	}
+	for _, char := range phoneNumber {
+		if char < '0' || char > '9' {
+			return false
+		}
+	}
+	return true
+}
+
+func phoneToJID(phoneNumber string) string {
+	return phoneNumber + "@s.whatsapp.net"
 }
 
 // Extract text content from a message
@@ -484,6 +536,15 @@ type DownloadMediaResponse struct {
 	Path     string `json:"path,omitempty"`
 }
 
+type WhitelistRequest struct {
+	PhoneNumbers []string `json:"phone_numbers"`
+}
+
+type WhitelistResponse struct {
+	Success bool   `json:"success"`
+	Message string `json:"message"`
+}
+
 // Store additional media info in the database
 func (store *MessageStore) StoreMediaInfo(id, chatJID, url string, mediaKey, fileSHA256, fileEncSHA256 []byte, fileLength uint64) error {
 	_, err := store.db.Exec(
@@ -641,7 +702,7 @@ func downloadMedia(client *whatsmeow.Client, messageStore *MessageStore, message
 	}
 
 	// Download the media using whatsmeow client
-	mediaData, err := client.Download(downloader)
+	mediaData, err := client.Download(context.Background(), downloader)
 	if err != nil {
 		return false, "", "", "", fmt.Errorf("failed to download media: %v", err)
 	}
@@ -703,6 +764,16 @@ func startRESTServer(client *whatsmeow.Client, messageStore *MessageStore, port 
 			return
 		}
 
+		recipientJID := req.Recipient
+		if !strings.Contains(recipientJID, "@") {
+			recipientJID = recipientJID + "@s.whatsapp.net"
+		}
+
+		if !messageStore.IsWhitelisted(recipientJID) {
+			http.Error(w, "Recipient is not whitelisted", http.StatusForbidden)
+			return
+		}
+
 		fmt.Println("Received request to send message", req.Message, req.MediaPath)
 
 		// Send the message
@@ -744,6 +815,11 @@ func startRESTServer(client *whatsmeow.Client, messageStore *MessageStore, port 
 			return
 		}
 
+		if !messageStore.IsWhitelisted(req.ChatJID) {
+			http.Error(w, "Chat is not whitelisted", http.StatusForbidden)
+			return
+		}
+
 		// Download the media
 		success, mediaType, filename, path, err := downloadMedia(client, messageStore, req.MessageID, req.ChatJID)
 
@@ -774,6 +850,213 @@ func startRESTServer(client *whatsmeow.Client, messageStore *MessageStore, port 
 		})
 	})
 
+	http.HandleFunc("/api/whitelist/add", func(w http.ResponseWriter, r *http.Request) {
+		if r.Method != http.MethodPost {
+			http.Error(w, "Method not allowed", http.StatusMethodNotAllowed)
+			return
+		}
+
+		var req WhitelistRequest
+		if err := json.NewDecoder(r.Body).Decode(&req); err != nil {
+			http.Error(w, "Invalid request format", http.StatusBadRequest)
+			return
+		}
+
+		w.Header().Set("Content-Type", "application/json")
+
+		if len(req.PhoneNumbers) == 0 {
+			http.Error(w, "phone_numbers is required", http.StatusBadRequest)
+			return
+		}
+
+		var jidsToAdd []string
+		var invalidNumbers []string
+
+		for _, phoneNumber := range req.PhoneNumbers {
+			if !validatePhoneNumber(phoneNumber) {
+				invalidNumbers = append(invalidNumbers, phoneNumber)
+				continue
+			}
+			jidsToAdd = append(jidsToAdd, phoneToJID(phoneNumber))
+		}
+
+		if len(invalidNumbers) > 0 {
+			w.WriteHeader(http.StatusBadRequest)
+			json.NewEncoder(w).Encode(WhitelistResponse{
+				Success: false,
+				Message: fmt.Sprintf("Invalid phone numbers: %v", invalidNumbers),
+			})
+			return
+		}
+
+		var failedJIDs []string
+		var successCount int
+
+		for _, jid := range jidsToAdd {
+			err := messageStore.SetWhitelist(jid, true)
+			if err != nil {
+				failedJIDs = append(failedJIDs, jid)
+			} else {
+				successCount++
+			}
+		}
+
+		if len(failedJIDs) > 0 {
+			w.WriteHeader(http.StatusInternalServerError)
+			json.NewEncoder(w).Encode(WhitelistResponse{
+				Success: false,
+				Message: fmt.Sprintf("Failed to add %d contacts. Errors: %v. Successfully added: %d", len(failedJIDs), failedJIDs, successCount),
+			})
+		} else {
+			json.NewEncoder(w).Encode(WhitelistResponse{
+				Success: true,
+				Message: fmt.Sprintf("Successfully added %d contacts to whitelist", successCount),
+			})
+		}
+	})
+
+	http.HandleFunc("/api/whitelist/remove", func(w http.ResponseWriter, r *http.Request) {
+		if r.Method != http.MethodPost {
+			http.Error(w, "Method not allowed", http.StatusMethodNotAllowed)
+			return
+		}
+
+		var req WhitelistRequest
+		if err := json.NewDecoder(r.Body).Decode(&req); err != nil {
+			http.Error(w, "Invalid request format", http.StatusBadRequest)
+			return
+		}
+
+		w.Header().Set("Content-Type", "application/json")
+
+		if len(req.PhoneNumbers) == 0 {
+			http.Error(w, "phone_numbers is required", http.StatusBadRequest)
+			return
+		}
+
+		var jidsToRemove []string
+		var invalidNumbers []string
+
+		for _, phoneNumber := range req.PhoneNumbers {
+			if !validatePhoneNumber(phoneNumber) {
+				invalidNumbers = append(invalidNumbers, phoneNumber)
+				continue
+			}
+			jidsToRemove = append(jidsToRemove, phoneToJID(phoneNumber))
+		}
+
+		if len(invalidNumbers) > 0 {
+			w.WriteHeader(http.StatusBadRequest)
+			json.NewEncoder(w).Encode(WhitelistResponse{
+				Success: false,
+				Message: fmt.Sprintf("Invalid phone numbers: %v", invalidNumbers),
+			})
+			return
+		}
+
+		var failedJIDs []string
+		var successCount int
+
+		for _, jid := range jidsToRemove {
+			err := messageStore.SetWhitelist(jid, false)
+			if err != nil {
+				failedJIDs = append(failedJIDs, jid)
+			} else {
+				successCount++
+			}
+		}
+
+		if len(failedJIDs) > 0 {
+			w.WriteHeader(http.StatusInternalServerError)
+			json.NewEncoder(w).Encode(WhitelistResponse{
+				Success: false,
+				Message: fmt.Sprintf("Failed to remove %d contacts. Errors: %v. Successfully removed: %d", len(failedJIDs), failedJIDs, successCount),
+			})
+		} else {
+			json.NewEncoder(w).Encode(WhitelistResponse{
+				Success: true,
+				Message: fmt.Sprintf("Successfully removed %d contacts from whitelist", successCount),
+			})
+		}
+	})
+
+	http.HandleFunc("/api/whitelist/list", func(w http.ResponseWriter, r *http.Request) {
+		if r.Method != http.MethodGet {
+			http.Error(w, "Method not allowed", http.StatusMethodNotAllowed)
+			return
+		}
+
+		whitelistedChats, err := messageStore.GetWhitelistedChats()
+		w.Header().Set("Content-Type", "application/json")
+
+		if err != nil {
+			w.WriteHeader(http.StatusInternalServerError)
+			json.NewEncoder(w).Encode(map[string]interface{}{
+				"success": false,
+				"message": fmt.Sprintf("Failed to get whitelisted chats: %v", err),
+			})
+		} else {
+			json.NewEncoder(w).Encode(map[string]interface{}{
+				"success": true,
+				"chats":   whitelistedChats,
+			})
+		}
+	})
+
+	http.HandleFunc("/api/whitelist/check", func(w http.ResponseWriter, r *http.Request) {
+		if r.Method != http.MethodPost {
+			http.Error(w, "Method not allowed", http.StatusMethodNotAllowed)
+			return
+		}
+
+		var req WhitelistRequest
+		if err := json.NewDecoder(r.Body).Decode(&req); err != nil {
+			http.Error(w, "Invalid request format", http.StatusBadRequest)
+			return
+		}
+
+		w.Header().Set("Content-Type", "application/json")
+
+		if len(req.PhoneNumbers) == 0 {
+			http.Error(w, "phone_numbers is required", http.StatusBadRequest)
+			return
+		}
+
+		var results []map[string]interface{}
+		var invalidNumbers []string
+
+		for _, phoneNumber := range req.PhoneNumbers {
+			if !validatePhoneNumber(phoneNumber) {
+				invalidNumbers = append(invalidNumbers, phoneNumber)
+				continue
+			}
+
+			jid := phoneToJID(phoneNumber)
+			isWhitelisted := messageStore.IsWhitelisted(jid)
+
+			results = append(results, map[string]interface{}{
+				"phone_number": phoneNumber,
+				"jid":          jid,
+				"whitelisted":  isWhitelisted,
+			})
+		}
+
+		if len(invalidNumbers) > 0 {
+			w.WriteHeader(http.StatusBadRequest)
+			json.NewEncoder(w).Encode(map[string]interface{}{
+				"success":       false,
+				"message":       fmt.Sprintf("Invalid phone numbers: %v", invalidNumbers),
+				"valid_results": results,
+			})
+			return
+		}
+
+		json.NewEncoder(w).Encode(map[string]interface{}{
+			"success": true,
+			"results": results,
+		})
+	})
+
 	// Start the server
 	serverAddr := fmt.Sprintf(":%d", port)
 	fmt.Printf("Starting REST API server on %s...\n", serverAddr)
@@ -800,14 +1083,14 @@ func main() {
 		return
 	}
 
-	container, err := sqlstore.New("sqlite3", "file:store/whatsapp.db?_foreign_keys=on", dbLog)
+	container, err := sqlstore.New(context.Background(), "sqlite3", "file:store/whatsapp.db?_foreign_keys=on", dbLog)
 	if err != nil {
 		logger.Errorf("Failed to connect to database: %v", err)
 		return
 	}
 
 	// Get device store - This contains session information
-	deviceStore, err := container.GetFirstDevice()
+	deviceStore, err := container.GetFirstDevice(context.Background())
 	if err != nil {
 		if err == sql.ErrNoRows {
 			// No device exists, create one
@@ -988,7 +1271,7 @@ func GetChatName(client *whatsmeow.Client, messageStore *MessageStore, jid types
 		logger.Infof("Getting name for contact: %s", chatJID)
 
 		// Just use contact info (full name)
-		contact, err := client.Store.Contacts.GetContact(jid)
+		contact, err := client.Store.Contacts.GetContact(context.Background(), jid)
 		if err == nil && contact.FullName != "" {
 			name = contact.FullName
 		} else if sender != "" {
