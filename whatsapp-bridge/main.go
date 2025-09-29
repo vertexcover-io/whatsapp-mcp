@@ -1647,16 +1647,26 @@ func placeholderWaveform(duration uint32) []byte {
 
 func authMiddleware(next http.HandlerFunc) http.HandlerFunc {
 	return func(w http.ResponseWriter, r *http.Request) {
+		w.Header().Set("Content-Type", "application/json")
+
 		authHeader := r.Header.Get("Authorization")
 		if authHeader == "" {
-			http.Error(w, "Unauthorized: missing authorization header", http.StatusUnauthorized)
+			w.WriteHeader(http.StatusUnauthorized)
+			json.NewEncoder(w).Encode(map[string]interface{}{
+				"success": false,
+				"message": "Unauthorized: missing authorization header",
+			})
 			return
 		}
 
 		decodedAuth, err := base64.StdEncoding.DecodeString(authHeader)
 
 		if err != nil || string(decodedAuth) != authSecret {
-			http.Error(w, "Unauthorized: invalid credentials", http.StatusUnauthorized)
+			w.WriteHeader(http.StatusUnauthorized)
+			json.NewEncoder(w).Encode(map[string]interface{}{
+				"success": false,
+				"message": "Unauthorized: invalid credentials",
+			})
 			return
 		}
 
