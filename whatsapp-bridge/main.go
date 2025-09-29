@@ -3,6 +3,7 @@ package main
 import (
 	"context"
 	"database/sql"
+	"encoding/base64"
 	"encoding/binary"
 	"encoding/json"
 	"fmt"
@@ -18,6 +19,7 @@ import (
 	"time"
 
 	_ "github.com/mattn/go-sqlite3"
+	"github.com/joho/godotenv"
 	"github.com/mdp/qrterminal"
 
 	"bytes"
@@ -30,6 +32,8 @@ import (
 	waLog "go.mau.fi/whatsmeow/util/log"
 	"google.golang.org/protobuf/proto"
 )
+
+var authSecret string
 
 // Message represents a chat message for our client
 type Message struct {
@@ -850,7 +854,7 @@ func startRESTServer(client *whatsmeow.Client, messageStore *MessageStore, port 
 		})
 	})
 
-	http.HandleFunc("/api/whitelist/add", func(w http.ResponseWriter, r *http.Request) {
+	http.HandleFunc("/api/whitelist/add", authMiddleware(func(w http.ResponseWriter, r *http.Request) {
 		if r.Method != http.MethodPost {
 			http.Error(w, "Method not allowed", http.StatusMethodNotAllowed)
 			return
@@ -913,7 +917,7 @@ func startRESTServer(client *whatsmeow.Client, messageStore *MessageStore, port 
 				Message: fmt.Sprintf("Successfully added %d contacts to whitelist", successCount),
 			})
 		}
-	})
+	}))
 
 	http.HandleFunc("/api/whitelist/remove", func(w http.ResponseWriter, r *http.Request) {
 		if r.Method != http.MethodPost {
@@ -1070,6 +1074,17 @@ func startRESTServer(client *whatsmeow.Client, messageStore *MessageStore, port 
 }
 
 func main() {
+	err := godotenv.Load()
+	if err != nil {
+		fmt.Println("Warning: .env file not found, using environment variables")
+	}
+
+	authSecret = os.Getenv("AUTH_SECRET")
+	if authSecret == "" {
+		fmt.Println("Error: AUTH_SECRET environment variable is required")
+		return
+	}
+
 	// Set up logger
 	logger := waLog.Stdout("Client", "INFO", true)
 	logger.Infof("Starting WhatsApp client...")
@@ -1628,4 +1643,23 @@ func placeholderWaveform(duration uint32) []byte {
 	}
 
 	return waveform
+}
+
+func authMiddleware(next http.HandlerFunc) http.HandlerFunc {
+	return func(w http.ResponseWriter, r *http.Request) {
+		authHeader := r.Header.Get("Authorization")
+		if authHeader == "" {
+			http.Error(w, "Unauthorized: missing authorization header", http.StatusUnauthorized)
+			return
+		}
+
+		decodedAuth, err := base64.StdEncoding.DecodeString(authHeader)
+
+		if err != nil || string(decodedAuth) != authSecret {
+			http.Error(w, "Unauthorized: invalid credentials", http.StatusUnauthorized)
+			return
+		}
+
+		next.ServeHTTP(w, r)
+	}
 }
