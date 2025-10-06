@@ -186,6 +186,24 @@ func (store *MessageStore) IsWhitelisted(jid string) bool {
 	return whitelisted
 }
 
+func (store *MessageStore) FindChatsByPattern(pattern string) ([]string, error) {
+	rows, err := store.db.Query("SELECT jid FROM chats WHERE LOWER(name) LIKE LOWER(?) OR jid LIKE ?", "%"+pattern+"%", "%"+pattern+"%")
+	if err != nil {
+		return nil, err
+	}
+	defer rows.Close()
+
+	var jids []string
+	for rows.Next() {
+		var jid string
+		if err := rows.Scan(&jid); err != nil {
+			continue
+		}
+		jids = append(jids, jid)
+	}
+	return jids, nil
+}
+
 func (store *MessageStore) SetWhitelist(jid string, whitelisted bool) error {
 	_, err := store.db.Exec("UPDATE chats SET whitelisted = ? WHERE jid = ?", whitelisted, jid)
 	return err
@@ -542,6 +560,7 @@ type DownloadMediaResponse struct {
 
 type WhitelistRequest struct {
 	PhoneNumbers []string `json:"phone_numbers"`
+	Identifiers  []string `json:"identifiers"`
 }
 
 type WhitelistResponse struct {
@@ -868,8 +887,8 @@ func startRESTServer(client *whatsmeow.Client, messageStore *MessageStore, port 
 
 		w.Header().Set("Content-Type", "application/json")
 
-		if len(req.PhoneNumbers) == 0 {
-			http.Error(w, "phone_numbers is required", http.StatusBadRequest)
+		if len(req.PhoneNumbers) == 0 && len(req.Identifiers) == 0 {
+			http.Error(w, "phone_numbers or identifiers is required", http.StatusBadRequest)
 			return
 		}
 
@@ -884,11 +903,31 @@ func startRESTServer(client *whatsmeow.Client, messageStore *MessageStore, port 
 			jidsToAdd = append(jidsToAdd, phoneToJID(phoneNumber))
 		}
 
+		for _, identifier := range req.Identifiers {
+			if strings.Contains(identifier, "@") {
+				jidsToAdd = append(jidsToAdd, identifier)
+			} else {
+				matchedJIDs, err := messageStore.FindChatsByPattern(identifier)
+				if err == nil {
+					jidsToAdd = append(jidsToAdd, matchedJIDs...)
+				}
+			}
+		}
+
 		if len(invalidNumbers) > 0 {
 			w.WriteHeader(http.StatusBadRequest)
 			json.NewEncoder(w).Encode(WhitelistResponse{
 				Success: false,
 				Message: fmt.Sprintf("Invalid phone numbers: %v", invalidNumbers),
+			})
+			return
+		}
+
+		if len(jidsToAdd) == 0 {
+			w.WriteHeader(http.StatusBadRequest)
+			json.NewEncoder(w).Encode(WhitelistResponse{
+				Success: false,
+				Message: "No matching chats found for the provided identifiers",
 			})
 			return
 		}
@@ -933,8 +972,8 @@ func startRESTServer(client *whatsmeow.Client, messageStore *MessageStore, port 
 
 		w.Header().Set("Content-Type", "application/json")
 
-		if len(req.PhoneNumbers) == 0 {
-			http.Error(w, "phone_numbers is required", http.StatusBadRequest)
+		if len(req.PhoneNumbers) == 0 && len(req.Identifiers) == 0 {
+			http.Error(w, "phone_numbers or identifiers is required", http.StatusBadRequest)
 			return
 		}
 
@@ -949,11 +988,31 @@ func startRESTServer(client *whatsmeow.Client, messageStore *MessageStore, port 
 			jidsToRemove = append(jidsToRemove, phoneToJID(phoneNumber))
 		}
 
+		for _, identifier := range req.Identifiers {
+			if strings.Contains(identifier, "@") {
+				jidsToRemove = append(jidsToRemove, identifier)
+			} else {
+				matchedJIDs, err := messageStore.FindChatsByPattern(identifier)
+				if err == nil {
+					jidsToRemove = append(jidsToRemove, matchedJIDs...)
+				}
+			}
+		}
+
 		if len(invalidNumbers) > 0 {
 			w.WriteHeader(http.StatusBadRequest)
 			json.NewEncoder(w).Encode(WhitelistResponse{
 				Success: false,
 				Message: fmt.Sprintf("Invalid phone numbers: %v", invalidNumbers),
+			})
+			return
+		}
+
+		if len(jidsToRemove) == 0 {
+			w.WriteHeader(http.StatusBadRequest)
+			json.NewEncoder(w).Encode(WhitelistResponse{
+				Success: false,
+				Message: "No matching chats found for the provided identifiers",
 			})
 			return
 		}
