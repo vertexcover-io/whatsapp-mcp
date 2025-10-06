@@ -3,6 +3,7 @@ package main
 import (
 	"context"
 	"database/sql"
+	"encoding/base64"
 	"encoding/binary"
 	"encoding/json"
 	"fmt"
@@ -18,6 +19,7 @@ import (
 	"time"
 
 	_ "github.com/mattn/go-sqlite3"
+	"github.com/joho/godotenv"
 	"github.com/mdp/qrterminal"
 
 	"bytes"
@@ -30,6 +32,8 @@ import (
 	waLog "go.mau.fi/whatsmeow/util/log"
 	"google.golang.org/protobuf/proto"
 )
+
+var authSecret string
 
 // Message represents a chat message for our client
 type Message struct {
@@ -180,6 +184,24 @@ func (store *MessageStore) IsWhitelisted(jid string) bool {
 		return false
 	}
 	return whitelisted
+}
+
+func (store *MessageStore) FindChatsByPattern(pattern string) ([]string, error) {
+	rows, err := store.db.Query("SELECT jid FROM chats WHERE LOWER(name) LIKE LOWER(?) OR jid LIKE ?", "%"+pattern+"%", "%"+pattern+"%")
+	if err != nil {
+		return nil, err
+	}
+	defer rows.Close()
+
+	var jids []string
+	for rows.Next() {
+		var jid string
+		if err := rows.Scan(&jid); err != nil {
+			continue
+		}
+		jids = append(jids, jid)
+	}
+	return jids, nil
 }
 
 func (store *MessageStore) SetWhitelist(jid string, whitelisted bool) error {
@@ -538,6 +560,7 @@ type DownloadMediaResponse struct {
 
 type WhitelistRequest struct {
 	PhoneNumbers []string `json:"phone_numbers"`
+	Identifiers  []string `json:"identifiers"`
 }
 
 type WhitelistResponse struct {
@@ -850,7 +873,7 @@ func startRESTServer(client *whatsmeow.Client, messageStore *MessageStore, port 
 		})
 	})
 
-	http.HandleFunc("/api/whitelist/add", func(w http.ResponseWriter, r *http.Request) {
+	http.HandleFunc("/api/whitelist/add", authMiddleware(func(w http.ResponseWriter, r *http.Request) {
 		if r.Method != http.MethodPost {
 			http.Error(w, "Method not allowed", http.StatusMethodNotAllowed)
 			return
@@ -864,8 +887,8 @@ func startRESTServer(client *whatsmeow.Client, messageStore *MessageStore, port 
 
 		w.Header().Set("Content-Type", "application/json")
 
-		if len(req.PhoneNumbers) == 0 {
-			http.Error(w, "phone_numbers is required", http.StatusBadRequest)
+		if len(req.PhoneNumbers) == 0 && len(req.Identifiers) == 0 {
+			http.Error(w, "phone_numbers or identifiers is required", http.StatusBadRequest)
 			return
 		}
 
@@ -880,11 +903,31 @@ func startRESTServer(client *whatsmeow.Client, messageStore *MessageStore, port 
 			jidsToAdd = append(jidsToAdd, phoneToJID(phoneNumber))
 		}
 
+		for _, identifier := range req.Identifiers {
+			if strings.Contains(identifier, "@") {
+				jidsToAdd = append(jidsToAdd, identifier)
+			} else {
+				matchedJIDs, err := messageStore.FindChatsByPattern(identifier)
+				if err == nil {
+					jidsToAdd = append(jidsToAdd, matchedJIDs...)
+				}
+			}
+		}
+
 		if len(invalidNumbers) > 0 {
 			w.WriteHeader(http.StatusBadRequest)
 			json.NewEncoder(w).Encode(WhitelistResponse{
 				Success: false,
 				Message: fmt.Sprintf("Invalid phone numbers: %v", invalidNumbers),
+			})
+			return
+		}
+
+		if len(jidsToAdd) == 0 {
+			w.WriteHeader(http.StatusBadRequest)
+			json.NewEncoder(w).Encode(WhitelistResponse{
+				Success: false,
+				Message: "No matching chats found for the provided identifiers",
 			})
 			return
 		}
@@ -913,7 +956,7 @@ func startRESTServer(client *whatsmeow.Client, messageStore *MessageStore, port 
 				Message: fmt.Sprintf("Successfully added %d contacts to whitelist", successCount),
 			})
 		}
-	})
+	}))
 
 	http.HandleFunc("/api/whitelist/remove", func(w http.ResponseWriter, r *http.Request) {
 		if r.Method != http.MethodPost {
@@ -929,8 +972,8 @@ func startRESTServer(client *whatsmeow.Client, messageStore *MessageStore, port 
 
 		w.Header().Set("Content-Type", "application/json")
 
-		if len(req.PhoneNumbers) == 0 {
-			http.Error(w, "phone_numbers is required", http.StatusBadRequest)
+		if len(req.PhoneNumbers) == 0 && len(req.Identifiers) == 0 {
+			http.Error(w, "phone_numbers or identifiers is required", http.StatusBadRequest)
 			return
 		}
 
@@ -945,11 +988,31 @@ func startRESTServer(client *whatsmeow.Client, messageStore *MessageStore, port 
 			jidsToRemove = append(jidsToRemove, phoneToJID(phoneNumber))
 		}
 
+		for _, identifier := range req.Identifiers {
+			if strings.Contains(identifier, "@") {
+				jidsToRemove = append(jidsToRemove, identifier)
+			} else {
+				matchedJIDs, err := messageStore.FindChatsByPattern(identifier)
+				if err == nil {
+					jidsToRemove = append(jidsToRemove, matchedJIDs...)
+				}
+			}
+		}
+
 		if len(invalidNumbers) > 0 {
 			w.WriteHeader(http.StatusBadRequest)
 			json.NewEncoder(w).Encode(WhitelistResponse{
 				Success: false,
 				Message: fmt.Sprintf("Invalid phone numbers: %v", invalidNumbers),
+			})
+			return
+		}
+
+		if len(jidsToRemove) == 0 {
+			w.WriteHeader(http.StatusBadRequest)
+			json.NewEncoder(w).Encode(WhitelistResponse{
+				Success: false,
+				Message: "No matching chats found for the provided identifiers",
 			})
 			return
 		}
@@ -1070,6 +1133,17 @@ func startRESTServer(client *whatsmeow.Client, messageStore *MessageStore, port 
 }
 
 func main() {
+	err := godotenv.Load()
+	if err != nil {
+		fmt.Println("Warning: .env file not found, using environment variables")
+	}
+
+	authSecret = os.Getenv("AUTH_SECRET")
+	if authSecret == "" {
+		fmt.Println("Error: AUTH_SECRET environment variable is required")
+		return
+	}
+
 	// Set up logger
 	logger := waLog.Stdout("Client", "INFO", true)
 	logger.Infof("Starting WhatsApp client...")
@@ -1628,4 +1702,33 @@ func placeholderWaveform(duration uint32) []byte {
 	}
 
 	return waveform
+}
+
+func authMiddleware(next http.HandlerFunc) http.HandlerFunc {
+	return func(w http.ResponseWriter, r *http.Request) {
+		w.Header().Set("Content-Type", "application/json")
+
+		authHeader := r.Header.Get("Authorization")
+		if authHeader == "" {
+			w.WriteHeader(http.StatusUnauthorized)
+			json.NewEncoder(w).Encode(map[string]interface{}{
+				"success": false,
+				"message": "Unauthorized: missing authorization header",
+			})
+			return
+		}
+
+		decodedAuth, err := base64.StdEncoding.DecodeString(authHeader)
+
+		if err != nil || string(decodedAuth) != authSecret {
+			w.WriteHeader(http.StatusUnauthorized)
+			json.NewEncoder(w).Encode(map[string]interface{}{
+				"success": false,
+				"message": "Unauthorized: invalid credentials",
+			})
+			return
+		}
+
+		next.ServeHTTP(w, r)
+	}
 }
